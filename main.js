@@ -145,7 +145,39 @@ const groundObjects = [fallbackGround];
 
 // Boîtes de collision horizontale (murs, caisses de couverture) — un
 // THREE.Box3 par obstacle. Vérifiées séparément du sol (vertical).
+// Collisions issues de public/assets/map-colliders.glb
+
+const loadingEl = document.getElementById('loading');
+const playButton = document.getElementById('play-button');
+
+const collisionMeshes = [];
 const collisionBoxes = [];
+
+let mapLoaded = false;
+let collidersLoaded = false;
+
+function showMapError(message, error = null) {
+  console.error(`[MAP-COLLIDERS] ${message}`, error ?? '');
+
+  if (loadingEl) {
+    loadingEl.style.display = 'block';
+    loadingEl.style.whiteSpace = 'pre-wrap';
+    loadingEl.textContent = `ERREUR DE CHARGEMENT\n${message}`;
+  }
+
+  if (playButton) {
+    playButton.disabled = true;
+    playButton.textContent = 'Chargement impossible';
+  }
+}
+
+function enableGameIfReady() {
+  if (!mapLoaded || !collidersLoaded) return;
+
+  loadingEl.style.display = 'none';
+  playButton.disabled = false;
+  playButton.textContent = 'Cliquer pour jouer';
+}
 
 // ---------------------------------------------------------------------------
 // Map : chargée depuis un fichier .glb (public/assets/map.glb) — plus aucune
@@ -154,10 +186,9 @@ const collisionBoxes = [];
 // d'apparition des armes/gilets, lumières d'ambiance) vient de mapData
 // (voir l'import en haut du fichier).
 // ---------------------------------------------------------------------------
-const loadingEl = document.getElementById('loading');
-const playButton = document.getElementById('play-button');
 
 const mapLoader = new GLTFLoader();
+
 mapLoader.load(
   '/assets/map.glb',
   (gltf) => {
@@ -167,62 +198,113 @@ mapLoader.load(
         child.receiveShadow = true;
       }
     });
+
     scene.add(gltf.scene);
     scene.remove(fallbackGround);
+    gltf.scene.updateMatrixWorld(true);
 
-    // Sol pour les collisions verticales (saut/gravité, marche sur le
-    // balcon/les rampes) : on ne raycaste QUE les meshes "marchables" (sol,
-    // rampes — repérés par leur nom), pas toute la map (murs, garde-corps,
-    // décor...) à chaque frame. Sur une map simple ça ne change rien, mais
-    // ça évite un vrai ralentissement le jour où ta map Fusion 360 sera
-    // beaucoup plus détaillée que ce placeholder en boîtes. Nomme tes
-    // surfaces marchables avec "floor" ou "ramp" quelque part dans leur nom
-    // (dans Fusion 360/Blender) pour que ça continue à marcher ; si aucun
-    // mesh ne correspond, on retombe sur la map entière (comportement
-    // d'avant, plus lent mais jamais cassé).
     const walkableMeshes = [];
     gltf.scene.traverse((child) => {
-      if (child.isMesh && /floor|ramp/i.test(child.name)) walkableMeshes.push(child);
+      if (child.isMesh && /floor|ramp/i.test(child.name)) {
+        walkableMeshes.push(child);
+      }
     });
+
     groundObjects.length = 0;
     groundObjects.push(...(walkableMeshes.length ? walkableMeshes : [gltf.scene]));
 
-    // Boîtes de collision horizontale (murs, caisses), voir mapData.colliders.
-    // Le type "floor" (sol du balcon) ne sert que côté serveur (blocage des
-    // tirs à hauteur du balcon) — côté client on marche dessus via le
-    // raycast ci-dessus, il ne faut surtout pas le traiter comme un mur.
-    mapData.colliders
-      .filter((c) => c.type === 'wall')
-      .forEach((c) => {
-        collisionBoxes.push(
-          new THREE.Box3(new THREE.Vector3(c.minX, c.minY, c.minZ), new THREE.Vector3(c.maxX, c.maxY, c.maxZ))
-        );
-      });
-
-    // Lumières d'ambiance (voir mapData.lights) — purement décoratives,
-    // aucune incidence sur le gameplay.
     (mapData.lights || []).forEach((l) => {
       const light = new THREE.PointLight(l.color, l.intensity, l.distance, l.decay);
       light.position.set(l.x, l.y, l.z);
       scene.add(light);
     });
 
-    loadingEl.style.display = 'none';
-    playButton.disabled = false;
-    playButton.textContent = 'Cliquer pour jouer';
+    mapLoaded = true;
+    console.info('[MAP-COLLIDERS] map.glb chargé correctement.');
+    enableGameIfReady();
   },
   (progress) => {
     if (progress.total) {
-      const pct = Math.round((progress.loaded / progress.total) * 100);
-      loadingEl.textContent = `Chargement de la map… ${pct}%`;
+      loadingEl.textContent =
+        `Chargement de map.glb… ${Math.round(progress.loaded / progress.total * 100)}%`;
     }
   },
   (error) => {
-    console.error('Erreur de chargement de la map :', error);
-    loadingEl.textContent =
-      "Map introuvable — dépose ton fichier .glb dans public/assets/map.glb (sol de secours actif)";
-    playButton.disabled = false;
-    playButton.textContent = 'Cliquer pour jouer (sans map)';
+    showMapError(
+      'Impossible de charger /assets/map.glb. Vérifie le chemin, la casse du nom et les erreurs réseau.',
+      error
+    );
+  }
+);
+
+// Chargement indépendant du fichier de collisions.
+mapLoader.load(
+  '/assets/map-colliders.glb',
+  (gltf) => {
+    gltf.scene.updateMatrixWorld(true);
+
+    let meshCount = 0;
+    let invalidCount = 0;
+
+    gltf.scene.traverse((child) => {
+      if (!child.isMesh || !child.geometry) return;
+
+      child.updateWorldMatrix(true, false);
+
+      const geometry = child.geometry;
+      if (!geometry.boundingBox) geometry.computeBoundingBox();
+
+      const box = new THREE.Box3().setFromObject(child);
+
+      if (
+        box.isEmpty() ||
+        !Number.isFinite(box.min.x) ||
+        !Number.isFinite(box.max.x)
+      ) {
+        invalidCount++;
+        console.error(
+          '[MAP-COLLIDERS] Mesh invalide dans map-colliders.glb :',
+          child.name || '(sans nom)',
+          box
+        );
+        return;
+      }
+
+      // Ces meshes restent invisibles : ils servent uniquement aux collisions.
+      collisionMeshes.push(child);
+
+      // Boîte englobante mondiale de chaque mesh de collision.
+      // Pour des meshes simples de murs et d'obstacles, cela fournit une
+      // collision robuste sans afficher la géométrie de collision.
+      collisionBoxes.push(box.clone());
+      meshCount++;
+    });
+
+    if (meshCount === 0) {
+      showMapError(
+        'map-colliders.glb a été chargé, mais aucun mesh de collision valide n’a été trouvé. Vérifie que le fichier contient des objets 3D exportés.'
+      );
+      return;
+    }
+
+    collidersLoaded = true;
+    console.info(
+      `[MAP-COLLIDERS] Collisions chargées : ${meshCount} mesh(s), ${collisionBoxes.length} boîte(s), ${invalidCount} mesh(s) invalide(s).`
+    );
+
+    enableGameIfReady();
+  },
+  (progress) => {
+    if (progress.total) {
+      loadingEl.textContent =
+        `Chargement de map-colliders.glb… ${Math.round(progress.loaded / progress.total * 100)}%`;
+    }
+  },
+  (error) => {
+    showMapError(
+      'Impossible de charger /assets/map-colliders.glb. Vérifie que le fichier existe dans public/assets/ et que son nom est exactement map-colliders.glb.',
+      error
+    );
   }
 );
 
@@ -938,8 +1020,12 @@ function collidesAt(x, z) {
     const closestZ = THREE.MathUtils.clamp(z, box.min.z, box.max.z);
     const dx = x - closestX;
     const dz = z - closestZ;
-    if (dx * dx + dz * dz < PLAYER_RADIUS * PLAYER_RADIUS) return true;
+
+    if (dx * dx + dz * dz < PLAYER_RADIUS * PLAYER_RADIUS) {
+      return true;
+    }
   }
+
   return false;
 }
 
